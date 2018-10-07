@@ -26,17 +26,7 @@
 Driver for interacting and playing media files with the VS1053 audio codec over
 a SPI connection.
 
-NOTE: This is not currently working for audio playback of files.  Only sine
-wave test currently works.  The problem is that pure Python code is currently
-too slow to keep up with feeding data to the VS1053 fast enough.  There's no
-interrupt support so Python code has to monitor the DREQ line and provide a
-small buffer of data when ready, but the overhead of the interpretor means we
-can't keep up.  Optimizing SPI to use DMA transfers could help but ultimately
-an interrupt-based approach is likely what can make this work better (or C
-functions built in to custom builds that monitor the DREQ line and feed a
-buffer of data).
-
-* Author(s): Tony DiCola
+* Author(s): Tony DiCola, Uri Shaked
 """
 import digitalio
 import time
@@ -87,15 +77,21 @@ class VS1053:
     # This is NOT thread/re-entrant safe (by design, for less memory hit).
     _SCI_SPI_BUFFER = bytearray(4)
 
-    def __init__(self, spi, cs, xdcs, dreq):
+    def __init__(self, spi, cs, xcs, xdcs, dreq, reset = None):
         # Create SPI device for VS1053
-        self._cs = digitalio.DigitalInOut(cs)
+        self._cs = digitalio.DigitalInOut(cs) if cs else None
         self._vs1053_spi = SPIDevice(spi, self._cs, baudrate=_COMMAND_BAUDRATE, polarity=0, phase=0)
         # Setup control lines.
+        self._xcs = digitalio.DigitalInOut(xcs)
+        self._xcs.switch_to_output(value=True)
         self._xdcs = digitalio.DigitalInOut(xdcs)
         self._xdcs.switch_to_output(value=True)
         self._dreq = digitalio.DigitalInOut(dreq)
         self._dreq.switch_to_input()
+        self._reset = None
+        if reset:
+            self._reset = digitalio.DigitalInOut(reset)
+            self._reset.switch_to_output(value=False)
         # Reset chip.
         self.reset()
         # Check version is 4 (VS1053 ID).
@@ -108,32 +104,52 @@ class VS1053:
         self._SCI_SPI_BUFFER[1] = address & 0xFF
         self._SCI_SPI_BUFFER[2] = (value >> 8) & 0xFF
         self._SCI_SPI_BUFFER[3] = value & 0xFF
+        self._xdcs.value = True
+        self.wait_until_ready()
+        self._xcs.value = False
         with self._vs1053_spi as spi:
             spi.configure(baudrate=_COMMAND_BAUDRATE)
             spi.write(self._SCI_SPI_BUFFER)
+        self._xcs.value = True
 
     def _sci_read(self, address):
         # Read a 16-bit big-endian value from the provided 8-bit address.
         # Write a 16-bit big-endian value to the provided 8-bit address.
         self._SCI_SPI_BUFFER[0] = _VS1053_SCI_READ
         self._SCI_SPI_BUFFER[1] = address & 0xFF
+        self._xdcs.value = True
+        self.wait_until_ready()
+        self._xcs.value = False
         with self._vs1053_spi as spi:
             spi.configure(baudrate=_COMMAND_BAUDRATE)
             spi.write(self._SCI_SPI_BUFFER, end=2)
             time.sleep(0.00001) # Delay 10 microseconds (at least)
             spi.readinto(self._SCI_SPI_BUFFER, end=2)
+        self._xcs.value = True
         return (self._SCI_SPI_BUFFER[0] << 8) | self._SCI_SPI_BUFFER[1]
 
     def soft_reset(self):
         """Perform a quick soft reset of the VS1053."""
-        self._sci_write(_VS1053_REG_MODE, _VS1053_MODE_SM_SDINEW | _VS1053_MODE_SM_RESET)
+        self._sci_write(_VS1053_REG_MODE, _VS1053_MODE_SM_SDINEW | _VS1053_MODE_SM_RESET) # Newmode, Reset, No L1-2
+        time.sleep(0.002)
+        self.wait_until_ready()
+        self._sci_write(_VS1053_REG_HDAT0, 0xABAD)
+        self._sci_write(_VS1053_REG_HDAT1, 0x1DEA)
         time.sleep(0.1)
+        self._sci_write(_VS1053_REG_CLOCKF,0xC000)   # Set the clock
+        self._sci_write(_VS1053_REG_AUDATA,0xBB81)   # Sample rate 48k, stereo
+        self._sci_write(_VS1053_REG_BASS, 0x0055)    # Set accent
 
     def reset(self):
         """Perform a longer full reset with clock and volume reset too."""
+        if self._reset:
+            self._reset.value = False
+        time.sleep(0.002)
+        self._xcs.value = True
         self._xdcs.value = True
+        if self._reset:
+            self._reset.value = True
         self.soft_reset()
-        time.sleep(0.1)
         self._sci_write(_VS1053_REG_CLOCKF, 0x6000)
         self.set_volume(40, 40)
 
@@ -174,6 +190,10 @@ class VS1053:
         """
         self._sci_write(_VS1053_REG_WRAMADDR, 0x1e05)
         return self._sci_read(_VS1053_REG_WRAM)
+        
+    def wait_until_ready(self):
+        while not self.ready_for_data:
+            pass
 
     def start_playback(self):
         """Prepare for playback of a file.  After calling this check the
@@ -200,11 +220,13 @@ class VS1053:
             if end is None:
                 end = len(data_buffer)
             self._xdcs.value = False
+            self._xcs.value = True
             with self._vs1053_spi as spi:
                 spi.configure(baudrate=_DATA_BAUDRATE)
                 spi.write(data_buffer, start=start, end=end)
         finally:
             self._xdcs.value = True
+            self._xcs.value = False
 
     def sine_test(self, n, seconds):
         """Play a sine wave for the specified number of seconds. Useful to
@@ -214,8 +236,7 @@ class VS1053:
         mode = self._sci_read(_VS1053_REG_MODE)
         mode |= 0x0020
         self._sci_write(_VS1053_REG_MODE, mode)
-        while not self.ready_for_data:
-            pass
+        self.wait_until_ready()
         try:
             self._xdcs.value = False
             with self._vs1053_spi as spi:
